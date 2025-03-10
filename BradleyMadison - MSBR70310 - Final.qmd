@@ -1,0 +1,726 @@
+---
+title: "MSBR 70310 Final Project"
+author: "Madison Bradley"
+format: 
+  html:
+    toc: true
+    toc-location: left
+    self-contained: true
+jupyter: python3
+---
+
+```{python}
+import pandas as pd
+import numpy as np
+import geopandas as gpd
+import pandas as pd
+from shapely.geometry import Polygon
+import requests
+import time
+import glob as glob
+import pymcdm.methods as mcdm
+```
+
+# Introduction
+Zipline is an American technology company that designs, builds, and operates autonomous drones. In 2016, Zipline launched a first-of-its-kind partnership with the Rwandan government to use the drones to deliver blood to rural health facilities. The result was a 51% decrease in mortality from post-partum hemorrhage [^1].
+
+Since then, Zipline has expanded to Ghana, Nigeria, Kenya, and Cote d'Ivoire delivering blood, vaccines, and other essential medicines that are difficult to stock in rural areas. This project explores the hypothetical expansion of Zipline into Zambia.
+
+Zambia's development status is similar to that of Zipline's existing partners. The country ranks 153rd out of 193 countries according to the Human Development Index [^2]. Eastern Province is Zambia's third most populous province and borders relatively stable neighboring countries Malawi and Mozambique [^3]. Road infrastructure is poor, and in the rainy season, many roads in rural areas become impassable [^4].
+
+The following exercise attempts to answer the question: If Zipline were to build a hub in Eastern Province, Zambia, where precisely should the hub be located to maximize impact? We measure impact based on number of facilities and population served and improvement over road transportation. Operational feasibility is considered based on cellular network coverage, which the drones require for communication with the hub.
+
+[^1]: Zipline. (n.d.). Zipline. https://www.flyzipline.com/ 
+[^2]: United Nations Development Program. (n.d.). Human Development Insights. https://hdr.undp.org/data-center/country-insights#/ranks 
+[^3]: City Population. (2024). Zambia: Administrative Division. https://www.citypopulation.de/en/zambia/admin/
+[^4]: Country Reports. (n.d.). Traffic and Road Conditions in Zambia. https://www.countryreports.org/country/Zambia/traffic.htm
+
+# Set Up and Visualization
+
+## Part 1: Zambia Administrative Boundaries
+*Source:* GADM (https://gadm.org/download_country.html)
+
+We begin by downloading and visualizing the administrative boundaries of Zambia in ArcGIS. We then subset these shapefiles to Eastern Province for further analysis.
+
+![Administrative Borders of Zambia](Map1.jpg)
+
+![Eastern Province, Zambia](Map2.jpg)
+
+![Eastern Province, Zambia (zoomed)](Map3.jpg)
+
+## Part 2: Zambia Roads
+*Source:* OpenStreetMap (https://data.humdata.org/dataset/hotosm_zmb_roads?force_layout=desktop)
+
+To visualize urbanicity and connectivity, we download and visualize all roadways in Zambia in ArcGIS. Again, we then subset these shapefiles to Eastern Province.
+
+![Roads in Eastern Province](Map16.jpg)
+
+## Part 3: Eastern Province Health Facilities
+*Source:* Zambia Ministry of Health Master Facility List (https://mfl.moh.gov.zm/)
+
+Health facilities in Zambia's Eastern Province are restocked by ZAMMSA, the Zambia Medicines and Medical Supplies Agency, from a regional hub in Chipata [^5]. Deliveries of standard products to multiple faciltiies are optimized along a single route using the Dynamic Routing Tool developed by Chemonics International on behalf of USAID [^6].
+
+Unlike standard products, specialty products, such as blood products and temperature-sensitive medications, are difficult for rural facilities to keep stocked. They likely manage their stock levels by ordering from the nearest hospital ^i^. Zipline drones are used to deliver these products to rural health facilities, saving travel time and ensuring product availability.
+
+We download the Master Facility List for Eastern Province from the Zambia Ministry of Health and visualize these facilities in ArcGIS. We then calculate the distance and travel time by road from each facility to its official resupply hub in Chipata. Taken as a direct measurement, this value represents the travel time saved over direct delivery from the hub, which is unlikely for standard or even specialty products. Rather, we suggest that this value be understood as the *maximum* travel time saved by using drones and a proxy metric for isolation. Zipline drones are better suited to resupply rural facilities, as the travel time saved by drones in urban areas is minimal.
+
+[^5]: ZAMMSA. (n.d.). ZAMMSA. https://zammsa.co.zm/
+[^6]: USAID. (2023). The Next Step in Planning Efficient Distribution of Health Commodities. https://ghsupplychain.org/sites/default/files/2023-11/00191_GHSCS_DispatchOptimizationTool_TechBrief_1.pdf
+
+^i^ Assumed as is standard practice. Actual resupply routes are not publically available.
+
+### **Step 1:** Load the Master Facility List (MFL) data.
+
+```{python}
+# Load
+MFL = pd.read_excel('C:/Users/mm-br/OneDrive - nd.edu/Documents/Mod 3/3 - Unstructured Data Analysis/Final Project/mfl_facilities_export20250217013607.xlsx')
+
+# View
+print(MFL.head())
+print(len(MFL))
+
+# Prepare latitude and longitude columns for spatial operations, remove spaces and convert to numeric
+MFL['Latitude'] = pd.to_numeric(MFL['Latitude'].astype(str).str.replace(' ', '', regex=True), errors='coerce')
+MFL['Longitude'] = pd.to_numeric(MFL['Longitude'].astype(str).str.replace(' ', '', regex=True), errors='coerce')
+```
+
+### **Step 2:** Subset the MFL data to only include facilities in Eastern Province.
+Visualization of the raw MFL export in ArcGIS revealed that, despite having downloaded data specifically for Eastern Province, many facility coordinates fell outside the province's boundaries. To limit our data to the province of interest and avoid errors in later clustering operations, we use the Eastern Province shapefile to filter the MFL data.
+
+```{python}
+# Load Eastern Province shapefile as GeoDataFrame
+EasternProvince_gdf = gpd.read_file('C:/Users/mm-br/OneDrive - nd.edu/Documents/Mod 3/3 - Unstructured Data Analysis/Final Project/ZAM - IS - Eastern Province.shp')
+
+# Convert MFL to GeoDataFrame to allow spatial operations
+# Convert latitude and longitude columns to point geometry
+MFL_gdf = gpd.GeoDataFrame(MFL, geometry=gpd.points_from_xy(MFL.Longitude, MFL.Latitude))
+
+# Ensure both GeoDataFrames have the same CRS (Coordinate Reference System)
+MFL_gdf = MFL_gdf.set_crs(EasternProvince_gdf.crs, allow_override=True)
+
+# Filter facilities based on Eastern Province boundaries
+geosubset_MFL_gdf = MFL_gdf[MFL_gdf.geometry.within(EasternProvince_gdf.unary_union)]
+
+# Convert back to DataFrame, remove geometry
+MFL_V1 = pd.DataFrame(geosubset_MFL_gdf.drop(columns='geometry'))
+
+# View
+print(MFL_V1.head())
+print(len(MFL_V1))
+
+# Save
+MFL_V1.to_csv('C:/Users/mm-br/OneDrive - nd.edu/Documents/Mod 3/3 - Unstructured Data Analysis/Final Project/MFL_V1.csv', index = False)
+```
+
+### **Step 3:** Calculate resupply distance and travel time by road.
+
+*Note:* Exact coordinates of ZAMMSA Chipata hub are not available, so we use the coordinates of Chipata Central Hospital as a proxy.
+
+```{python}
+# Load MFL_V1
+MFL_V1 = pd.read_csv('C:/Users/mm-br/OneDrive - nd.edu/Documents/Mod 3/3 - Unstructured Data Analysis/Final Project/MFL_V1.csv')
+```
+
+```{python}
+#| eval: false
+
+# Use OpenRouteService Reverse Geocoding API to return nearest routable coordinates for each facility
+geocodes = []
+
+for i in range(len(MFL_V1)):
+  if (i + 1) % 100 == 0:
+    time.sleep(120)
+  api_key = '5b3ce3597851110001cf6248df4e0aade92844a8bf157de2e91818f5'
+  point_lat = str(MFL_V1.iloc[i]['Latitude'])
+  point_lon = str(MFL_V1.iloc[i]['Longitude'])
+  link = (
+    'https://api.openrouteservice.org/geocode/reverse?api_key={}&point.lon={}'
+    '&point.lat={}&size=1&boundary.country=ZMB'.format(api_key, point_lon, point_lat))
+  geocode_request = requests.get(link)
+  geocodes.append(geocode_request.json()['features'][0]['geometry']['coordinates'])
+```
+
+```{python}
+#| eval: false
+
+# Find Chipata General Hospital georeference
+api_key = '5b3ce3597851110001cf6248df4e0aade92844a8bf157de2e91818f5'
+point_lat = '-13.641615049376906'
+point_lon = '32.63751062298343'
+link = (
+  'https://api.openrouteservice.org/geocode/reverse?api_key={}&point.lon={}'
+  '&point.lat={}&size=1&boundary.country=ZMB'.format(api_key, point_lon, point_lat))
+geocode_request = requests.get(link)
+ChipataGeneralHospital = (geocode_request.json()['features'][0]['geometry']['coordinates'])
+ChipataGeneralHospital_lon = ChipataGeneralHospital[0]
+ChipataGeneralHospital_lat = ChipataGeneralHospital[1]
+ChipataGeneralHospital = str(ChipataGeneralHospital_lon) + ',' + str(ChipataGeneralHospital_lat)
+```
+
+```{python}
+#| eval: false
+
+# Convert to DataFrame
+geocodes = pd.DataFrame(geocodes, columns=['Longitude', 'Latitude'])
+
+# Save
+geocodes.to_csv('C:/Users/mm-br/OneDrive - nd.edu/Documents/Mod 3/3 - Unstructured Data Analysis/Final Project/geocodes.csv')
+```
+
+```{python}
+# Load geocodes
+geocodes = pd.read_csv('C:/Users/mm-br/OneDrive - nd.edu/Documents/Mod 3/3 - Unstructured Data Analysis/Final Project/geocodes.csv')
+
+# View
+print(geocodes.head())
+print(len(geocodes))
+
+# Add to MFL_V1
+MFL_V1['Geocoded_Lon'] = geocodes['Longitude']
+MFL_V1['Geocoded_Lat'] = geocodes['Latitude']
+
+# Save
+MFL_V1.to_csv('C:/Users/mm-br/OneDrive - nd.edu/Documents/Mod 3/3 - Unstructured Data Analysis/Final Project/MFL_V2.csv', index = False)
+```
+
+```{python}
+# Load MFL_V2
+MFL_V2 = pd.read_csv('C:/Users/mm-br/OneDrive - nd.edu/Documents/Mod 3/3 - Unstructured Data Analysis/Final Project/MFL_V2.csv')
+
+# View
+print(MFL_V2.head())
+```
+
+```{python}
+#| eval: false
+
+# Use OpenRouteService Directions API to calculate distance/time from Chipata General Hospital to each facility
+distance = []
+duration = []
+
+for i in range(len(MFL_V2)):
+  if (i + 1) % 40 == 0:
+    time.sleep(80)
+  api_key = '5b3ce3597851110001cf6248df4e0aade92844a8bf157de2e91818f5'
+  start = ChipataGeneralHospital
+  end = (
+    str(MFL_V2.iloc[i]['Geocoded_Lon']) + 
+    ',' + 
+    str(MFL_V2.iloc[i]['Geocoded_Lat']))
+  link = (
+    'https://api.openrouteservice.org/v2/directions/driving-car?'
+    'api_key={}&start={}&end={}'.format(api_key, start, end))
+  route_request = requests.get(link)
+  if 'features' in route_request.json():
+    distance.append(route_request.json()['features'][0]['properties']['segments'][0]['distance'])
+    duration.append(route_request.json()['features'][0]['properties']['segments'][0]['duration'])
+  else:
+    distance.append('')
+    duration.append('')
+```
+
+```{python}
+#| eval: false
+
+# Add distance and duration to MFL_V2
+distance = pd.to_numeric(distance)
+duration = pd.to_numeric(duration)
+MFL_V2['Distance_KM'] = distance / 1000
+MFL_V2['Duration_HR'] = duration / 3600
+
+# Save
+MFL_V2.to_csv('C:/Users/mm-br/OneDrive - nd.edu/Documents/Mod 3/3 - Unstructured Data Analysis/Final Project/MFL_V3.csv', index = False)
+```
+
+### **Step 4:** Clean and finalize facility list.
+
+```{python}
+# Load MFL_V3
+MFL_V3 = pd.read_csv('C:/Users/mm-br/OneDrive - nd.edu/Documents/Mod 3/3 - Unstructured Data Analysis/Final Project/MFL_V3.csv')
+
+# View
+print(MFL_V3.head())
+```
+
+```{python}
+# Remove unnecessary columns
+MFL_V3 = MFL_V3.drop(columns=['MFL Code', 'DHIS2 UID', 'Hims code', 'Zone', 'Constituency', 'Ward', 'Location', 'Mobility status', 'Accesibility', 'Operational status', 'Catchment population head count', 'Number of households'])
+
+# Note sparsity
+routing_sparsity = (MFL_V3[MFL_V3['Distance_KM'] == ''].sum()) / len(MFL_V3)
+
+# Save
+MFL_V3.to_csv('C:/Users/mm-br/OneDrive - nd.edu/Documents/Mod 3/3 - Unstructured Data Analysis/Final Project/MFL_VF.csv', index = False)
+```
+
+```{python}
+# Load MFL_VF
+MFL_VF = pd.read_csv('C:/Users/mm-br/OneDrive - nd.edu/Documents/Mod 3/3 - Unstructured Data Analysis/Final Project/MFL_VF.csv')
+
+# View
+print(MFL_VF.head())
+```
+
+![Health Facilities in Eastern Province](Map5.jpg)
+
+## Part 4: Cellular Network Coverage
+*Source:* OpenCellID (https://www.opencellid.org/)
+
+Zipline drones require cellular network coverage to operate [^7]. To estimate network coverage in Eastern Province, we pull cell tower data from OpenCellID's API. The data includes tower latitude and longitude, radio (2G, 3G, 4G), and signal range, among other variables. For this exercise, we assume that all towers are operational and that 2G coverage is sufficient for Zipline drones.
+
+[^7]: Spectrum. (2019). In the Air with Zipline's Medical Delivery Drones. https://spectrum.ieee.org/in-the-air-with-ziplines-medical-delivery-drones
+
+### **Step 1:** Subset Eastern Province into 0.015 x 0.015 degree grid cells.
+OpenCellID's API can only process requests for small areas. Based on the known maximum and minimum latitude and longitude values for Eastern Province (from ArcGIS), we create a grid of 0.015 x 0.015 degree cells and store the boundaries in a DataFrame.
+
+```{python}
+# Define lat/lon range and step size
+lat_range = np.round(np.arange(-15.0, -11.595, 0.015), 3)
+lon_range = np.round(np.arange(30.0, 33.585, 0.015), 3)
+
+# Create list to store grid cell boundaries
+cells = []
+
+# Loop through the latitude and longitude ranges to pull grid cell boundaries
+for i in range(len(lat_range) - 1):
+    for j in range(len(lon_range) - 1):
+        latmin = lat_range[i]
+        latmax = lat_range[i + 1]
+        lonmin = lon_range[j]
+        lonmax = lon_range[j + 1]
+        cells.append([latmin, latmax, lonmin, lonmax])
+
+# Create DataFrame from list
+cells = pd.DataFrame(cells, columns=["latmin", "latmax", "lonmin", "lonmax"])
+
+# View DataFrame
+print(cells.head())
+print(len(cells))
+```
+
+### **Step 2:** Reduce the grid cells to only those that are within the Eastern Province boundary shapefile.
+Because Eastern Province is not a perfect square, many of the grid cells generated in Step 1 are outside of the province's boundaries. To reduce the number of calls to the OpenCellID API, we will remove the grid cells that are not within the Eastern Province shapefile.
+
+```{python}
+# Load Eastern Province shapefile as GeoDataFrame
+EasternProvince_gdf = gpd.read_file('C:/Users/mm-br/OneDrive - nd.edu/Documents/Mod 3/3 - Unstructured Data Analysis/Final Project/ZAM - IS - Eastern Province.shp')
+
+# Write function to convert cell boundaries to polygons by using lat/lon min/max to define cell corners
+def create_polygon(row):
+    return Polygon([(row['lonmin'], row['latmin']),
+                    (row['lonmin'], row['latmax']),
+                    (row['lonmax'], row['latmax']),
+                    (row['lonmax'], row['latmin'])])
+
+# Apply the function to create polygons for each grid cell and add them to a new column
+cells['geometry'] = cells.apply(create_polygon, axis=1)
+
+# Convert the cells DataFrame into a GeoDataFrame to allow spatial operations
+cells_gdf = gpd.GeoDataFrame(cells, geometry='geometry')
+
+# Ensure both GeoDataFrames have the same CRS (Coordinate Reference System)
+cells_gdf = cells_gdf.set_crs(EasternProvince_gdf.crs, allow_override=True)
+
+# Filter cells based on Eastern Province boundaries
+geosubset_cells_gdf = cells_gdf[cells_gdf.geometry.within(EasternProvince_gdf.unary_union)]
+
+# Convert back to DataFrame, remove geometry
+cells = pd.DataFrame(geosubset_cells_gdf.drop(columns='geometry'))
+
+# View DataFrame
+print(cells.head())
+print(len(cells))
+```
+
+### **Step 3:** Pull OpenCellID data for each grid cell.
+Having reduced the number of grid cells to a (slightly) more manageable number, we can now loop through them to pull data through the OpenCellID API. The free version of the API has a limit of 5000 calls per day.
+
+```{python}
+# Subset for API batching
+subset1 = cells.iloc[0:5000, :]
+subset2 = cells.iloc[5000:10000, :]
+subset3 = cells.iloc[10000:15000, :]
+subset4 = cells.iloc[15000:len(cells), :]
+```
+
+```{python}
+#| eval: false
+
+# Subset 1: Loop through cells to pull OpenCellID data
+for i in range(len(subset1)):
+  if (i + 1) % 1000 == 0:
+    time.sleep(120)
+  api_key = 'pk.763aaba1a5d1ced55fac8eb302d7828b'
+  mcc = 645
+  output_format = 'csv'
+  latmin = subset1.iloc[i]['latmin']
+  latmax = subset1.iloc[i]['latmax']
+  lonmin = subset1.iloc[i]['lonmin']
+  lonmax = subset1.iloc[i]['lonmax']
+  link = (
+   'https://www.opencellid.org/cell/getInArea?key={}&BBOX={},{},{},{}&'
+   'mcc={}&format={}'.format(api_key, latmin, lonmin, latmax, lonmax, mcc, output_format))
+  oci_request = requests.get(link)
+  file_name = 'subset1.csv'
+  with open(file_name, 'ab') as file:
+    headers = oci_request.content.decode().splitlines()[0] # Extract the first line as headers
+    file.write(f"{headers}\n".encode()) # Write headers to file
+    data = oci_request.content.decode().splitlines()[1:] # Extract all lines after the headers
+    for i in data: # Loop through each line of data
+      file.write(f"{i}\n".encode()) # Write each line to the file, avoiding overwriting earlier lines
+```
+
+```{python}
+#| eval: false
+
+# Subset 2: Loop through cells to pull OpenCellID data
+for i in range(len(subset2)):
+  if (i + 1) % 1000 == 0:
+    time.sleep(120)
+  api_key = 'pk.763aaba1a5d1ced55fac8eb302d7828b'
+  mcc = 645
+  output_format = 'csv'
+  latmin = subset2.iloc[i]['latmin']
+  latmax = subset2.iloc[i]['latmax']
+  lonmin = subset2.iloc[i]['lonmin']
+  lonmax = subset2.iloc[i]['lonmax']
+  link = (
+   'https://www.opencellid.org/cell/getInArea?key={}&BBOX={},{},{},{}&'
+   'mcc={}&format={}'.format(api_key, latmin, lonmin, latmax, lonmax, mcc, output_format))
+  oci_request = requests.get(link)
+  file_name = 'subset2.csv'
+  with open(file_name, 'ab') as file:
+    headers = oci_request.content.decode().splitlines()[0] # Extract the first line as headers
+    file.write(f"{headers}\n".encode()) # Write headers to file
+    data = oci_request.content.decode().splitlines()[1:] # Extract all lines after the headers
+    for i in data: # Loop through each line of data
+      file.write(f"{i}\n".encode()) # Write each line to the file, avoiding overwriting earlier lines
+```
+
+```{python}
+#| eval: false
+
+# Subset 3: Loop through cells to pull OpenCellID data
+for i in range(len(subset3)):
+  if (i + 1) % 1000 == 0:
+    time.sleep(120)
+  api_key = 'pk.763aaba1a5d1ced55fac8eb302d7828b'
+  mcc = 645
+  output_format = 'csv'
+  latmin = subset3.iloc[i]['latmin']
+  latmax = subset3.iloc[i]['latmax']
+  lonmin = subset3.iloc[i]['lonmin']
+  lonmax = subset3.iloc[i]['lonmax']
+  link = (
+   'https://www.opencellid.org/cell/getInArea?key={}&BBOX={},{},{},{}&'
+   'mcc={}&format={}'.format(api_key, latmin, lonmin, latmax, lonmax, mcc, output_format))
+  oci_request = requests.get(link)
+  file_name = 'subset3.csv'
+  with open(file_name, 'ab') as file:
+    headers = oci_request.content.decode().splitlines()[0] # Extract the first line as headers
+    file.write(f"{headers}\n".encode()) # Write headers to file
+    data = oci_request.content.decode().splitlines()[1:] # Extract all lines after the headers
+    for i in data: # Loop through each line of data
+      file.write(f"{i}\n".encode()) # Write each line to the file, avoiding overwriting earlier lines
+```
+
+```{python}
+#| eval: false
+
+# Subset 4: Loop through cells to pull OpenCellID data
+for i in range(len(subset4)):
+  if (i + 1) % 1000 == 0:
+    time.sleep(120)
+  api_key = 'pk.763aaba1a5d1ced55fac8eb302d7828b'
+  mcc = 645
+  output_format = 'csv'
+  latmin = subset4.iloc[i]['latmin']
+  latmax = subset4.iloc[i]['latmax']
+  lonmin = subset4.iloc[i]['lonmin']
+  lonmax = subset4.iloc[i]['lonmax']
+  link = (
+   'https://www.opencellid.org/cell/getInArea?key={}&BBOX={},{},{},{}&'
+   'mcc={}&format={}'.format(api_key, latmin, lonmin, latmax, lonmax, mcc, output_format))
+  oci_request = requests.get(link)
+  file_name = 'subset4.csv'
+  with open(file_name, 'ab') as file:
+    headers = oci_request.content.decode().splitlines()[0] # Extract the first line as headers
+    file.write(f"{headers}\n".encode()) # Write headers to file
+    data = oci_request.content.decode().splitlines()[1:] # Extract all lines after the headers
+    for i in data: # Loop through each line of data
+      file.write(f"{i}\n".encode()) # Write each line to the file, avoiding overwriting earlier lines
+```
+
+### **Step 4:** Filter output for cell tower data.
+The raw output from OpenCellID's API includes repeat headers and many rows indicating that no cell towers were present in the specified coordinates. To make our later clustering analysis more efficient, we remove all rows except for those containing cell tower data.
+
+```{python}
+# Generate list of files
+file_list = glob.glob("C:/Users/mm-br/OneDrive - nd.edu/Documents/Mod 3/3 - Unstructured Data Analysis/Final Project/OpenCellID/*")
+
+# Iterate through list of files
+OpenCellID = []
+
+for i in file_list:
+  column_names = ['lat', 'lon', 'mcc', 'mnc', 'lac', 'cellid', 'averageSignalStrength',
+       'range', 'samples', 'changeable', 'radio', 'rnc', 'cid', 'tac', 'sid',
+       'nid', 'bid']
+  temp = pd.read_csv(i, names = column_names, header=None)
+  filename = i.split('OpenCellID\\')[1]
+  OpenCellID.append(temp)
+
+# Concatenate the separate csvs in the OpenCellID list
+OpenCellID = pd.concat(OpenCellID)
+
+# View
+print(OpenCellID.head())
+print(len(OpenCellID))
+
+# Filter for rows with data
+OpenCellID = OpenCellID[OpenCellID['mcc'] == '645']
+
+# View
+print(OpenCellID.head())
+print(len(OpenCellID))
+
+# Save
+OpenCellID.to_csv('C:/Users/mm-br/OneDrive - nd.edu/Documents/Mod 3/3 - Unstructured Data Analysis/Final Project/OpenCellID.csv', index = False)
+```
+
+![Cell Towers (red) in Eastern Province](Map17.jpg)
+
+# Clustering
+Having now gathered all required data, we begin the process of selection by clustering health facilities purely based on their geographic location. We use K-Means clustering for this process because it is fairly simple and the resulting clusters must be spherical (or circular in 2D)[^8], [^9].
+
+[^8]: Real Python. (n.d.). K-Means Clustering in Python: A Practical Guide. https://realpython.com/k-means-clustering-python/
+[^9]: Scikit-learn. (n.d.). KMeans. https://scikit-learn.org/stable/modules/generated/sklearn.cluster.KMeans.html
+
+## Part 5: K-Means Clustering
+
+### **Step 1:** Run K-Means with cluster radius limit.
+Zipline drones can travel up to 80 km from a hub to make deliveries. To ensure that cluster radii do not exceed this limit, we run K-Means with a custom function to calculate and limit cluster radii based on the great circle distance of each facility from its cluster centroid. Great circle distance is used (as opposed to Euclidian distance, which is suitable for 2D planes) to account for the Earth's curvature.
+
+```{python}
+from sklearn.cluster import KMeans
+from geopy.distance import great_circle
+
+# Build function to calculate and limit cluster radius
+def radius_constraint(facilities, labels, centroids, max_radius_km = 80):
+  for i, centroid in enumerate(centroids):
+    cluster_points = facilities[labels == i]
+    centroid_coords = (centroid[0], centroid[1])
+
+    radius = max(great_circle((lat, lon), centroid_coords).km for lat, lon in cluster_points)
+
+    if radius > max_radius_km:
+      return False
+  return True
+
+# Build function to find required no. of clusters (using radius_constraint function)
+def find_clusters(MFL_VF, max_radius_km = 80):
+  facilities = MFL_VF[['Latitude', 'Longitude']].values
+  k = 1
+
+  while True:
+    kmeans = KMeans(n_clusters = k, random_state = 1, n_init = 'auto')
+    labels = kmeans.fit_predict(facilities)
+    centroids = kmeans.cluster_centers_
+
+    if radius_constraint(facilities, labels, centroids, max_radius_km):
+      break
+    k = k + 1
+  
+  MFL_VF['Cluster'] = labels
+  return MFL_VF, centroids
+
+# Run clustering process
+MFL_VF, centroids = find_clusters(MFL_VF, max_radius_km = 80)
+
+# Convert centroids to DataFrame
+clusters = pd.DataFrame(centroids, columns = ['Latitude', 'Longitude'])
+
+# Add cluster labels
+clusters['Cluster_No'] = range(0, len(centroids))
+
+# Save
+MFL_VF.to_csv('C:/Users/mm-br/OneDrive - nd.edu/Documents/Mod 3/3 - Unstructured Data Analysis/Final Project/MFL_VF_Clustered.csv', index = False)
+
+clusters.to_csv('C:/Users/mm-br/OneDrive - nd.edu/Documents/Mod 3/3 - Unstructured Data Analysis/Final Project/clusters.csv', index = False)
+```
+
+![Health Facilities Clustered by K-Means with 80 km Radii](Map8.jpg)
+
+### **Step 2:** Basic aggregations by cluster.
+To compare clusters, we perform simple aggreations on facility count, catchment population, distance, and duration. Note that summation cannot be performed on distance and duration due to sparsity of data.
+
+```{python}
+# Load MFL_VF_Clustered
+MFL_VF_Clustered = pd.read_csv('C:/Users/mm-br/OneDrive - nd.edu/Documents/Mod 3/3 - Unstructured Data Analysis/Final Project/MFL_VF_Clustered.csv')
+
+# View
+print(MFL_VF_Clustered.head())
+```
+
+```{python}
+# Basic aggregations
+cluster_comparison = MFL_VF_Clustered.groupby('Cluster').agg({'Name': 'count', 'Catchment population cso': 'sum', 'Distance_KM': 'mean', 'Duration_HR': 'mean'})
+
+# Rename columns
+cluster_comparison = cluster_comparison.rename(columns = {'Name': 'Facilities_Count', 'Catchment population cso': 'Population_Sum', 'Distance_KM': 'Distance_KM_Mean', 'Duration_HR': 'Duration_HR_Mean'})
+
+# Rounding for readability
+cluster_comparison = cluster_comparison.round(2)
+
+# View
+print(cluster_comparison)
+
+# Save
+cluster_comparison.to_csv('C:/Users/mm-br/OneDrive - nd.edu/Documents/Mod 3/3 - Unstructured Data Analysis/Final Project/cluster_comparison.csv')
+```
+
+### **Step 3:** Add network coverage by cluster.
+With our clusters now established, we can calculate the percentage of the cluster area covered by 2G, 3G, and 4G networks. For simplicity, I performed this operation in ArcGIS and then exported the results as CSVs.
+
+The process in ArcGIS involved: building buffer polygons over the cell tower points with the radii equivalent to their range from OpenCellID, then overlaying those polygons with the cluster polygons and performing union and intersect operations. I then calculated the area of the resulting polygons (which had been subset to only include the cluster area and avoid double-counting in cases of tower overlap) and divided by the total cluster area to get the percentage of coverage.
+
+```{python}
+# Load cluster_comparison
+cluster_comparison = pd.read_csv('C:/Users/mm-br/OneDrive - nd.edu/Documents/Mod 3/3 - Unstructured Data Analysis/Final Project/cluster_comparison.csv')
+```
+
+```{python}
+# Load OpenCellID_Cluster_Coverage
+OpenCellID_Cluster_Coverage = pd.read_csv('C:/Users/mm-br/OneDrive - nd.edu/Documents/Mod 3/3 - Unstructured Data Analysis/Final Project/OpenCellID_Cluster_Coverage.csv')
+
+# Combine with cluster_comparison
+cluster_comparison['Overlap_Perc_2G'] = OpenCellID_Cluster_Coverage['Overlap_Perc_2G']
+cluster_comparison['Overlap_Perc_3G4G'] = OpenCellID_Cluster_Coverage['Overlap_Perc_3G4G']
+
+# View
+print(cluster_comparison)
+```
+
+# Optimization
+Having established our clusters and calculated all necessary decision criteria, we now move on to optimization. To choose the best cluster, we consider: 1) total number of facilities, 2) total catchment population, 3) average road distance to Chipata resupply hub, 4) average travel time to Chipata resupply hub, and 5) 2G network coverage. Note that 3G and 4G network coverage was less than 1% in all clusters and was therefore not considered significant.
+
+We perform optimization using the PyMCDM library, which includes the Technique for the Order of Prioritisation by Similarity to Ideal Solution (TOPSIS) method for multi-criteria decision making[^10].  The TOPSIS method takes three arguments: a matrix of alternatives, an array of criteria weights, and an array of criteria types (maximization or minimization). The method returns a score for each alternative and a ranking based on those scores.
+
+[^10]: PyPi.org. (n.d.). PyMCDM. https://pypi.org/project/pymcdm/?utm_source=chatgpt.com#c1
+
+## Part 6: Initial Narrowing
+We perform an intial round of optimization to select the three best clusters for further consideration.  The decision weights are established as follows: 0.3 for facilities count, 0.3 for catchment population, 0.1 for distance, 0.1 for duration, and 0.2 for 2G network coverage. These weights are based purely on my own judgement and could be adjusted based on real business requirements. I give priority to facilities count and catchment population as measures of potential impact, followed by 2G network coverage as a measure of operational feasibility. Distance and duration are given less weight for reasons outlined in Part 3.
+
+After identifying our top three clusters, we isolate them in ArcGIS for further analysis.
+
+```{python}
+decision_matrix = np.array(cluster_comparison.iloc[:, 2:7])
+
+decision_weights = np.array([0.3, 0.3, 0.1, 0.1, 0.2])
+
+decision_types = np.array([1, 1, 1, 1, 1])
+
+topsis = mcdm.TOPSIS()
+scores = topsis(decision_matrix, decision_weights, types = decision_types)
+ranking = np.argsort(scores)[::-1]+1
+
+print("Scores: ", scores)
+print("Ranking: ", ranking)
+```
+
+![Semifinalist Clusters](Map10.jpg)
+
+## Part 7: Final Selection
+Having found our top three clusters, we now begin the process of final selection, which involves re-running the optimization model with updated criteria on each cluster.
+
+### **Step 1:** Re-classify health facilities within top three clusters (ArcGIS).
+As we imagine the implementation of a Zipline hub at any of our clusters, we must consider that the hub would serve not only those facilities initially assigned to it by the K-Means clustering, but any facilities falling within its 80 km radius. To account for this, we reclassify facilities into clusters (allowing assignment of facilities to multiple clusters) based on their intersection with the 80 km buffer around each cluster centroid. This operation was performed mostly in ArcGIS for simplicity and then completed here after export to CSVs.
+
+After identifying all servicable facilities for each cluster, we re-run our aggregations to prepare for optmization.
+
+```{python}
+# Load
+Cluster0Reselect = pd.read_csv('C:/Users/mm-br/OneDrive - nd.edu/Documents/Mod 3/3 - Unstructured Data Analysis/Final Project/Cluster0Reselect.csv')
+
+Cluster4Reselect = pd.read_csv('C:/Users/mm-br/OneDrive - nd.edu/Documents/Mod 3/3 - Unstructured Data Analysis/Final Project/Cluster4Reselect.csv')
+
+Cluster5Reselect = pd.read_csv('C:/Users/mm-br/OneDrive - nd.edu/Documents/Mod 3/3 - Unstructured Data Analysis/Final Project/Cluster5Reselect.csv')
+
+# Update cluster number consistent with reclassification
+Cluster0Reselect['Cluster'] = 0
+Cluster4Reselect['Cluster'] = 4
+Cluster5Reselect['Cluster'] = 5
+
+# Combine
+Clusters_Semifinal = pd.concat([Cluster0Reselect, Cluster4Reselect, Cluster5Reselect])
+
+# Basic aggregations
+Clusters_Semifinal_Comparison = Clusters_Semifinal.groupby('Cluster').agg({'Name': 'count', 'Catchment_population_cso': 'sum', 'Distance_KM': 'mean', 'Duration_HR': 'mean'})
+
+# Rename columns
+Clusters_Semifinal_Comparison = Clusters_Semifinal_Comparison.rename(columns = {'Name': 'Facilities_Count', 'Catchment_population_cso': 'Population_Sum', 'Distance_KM': 'Distance_KM_Mean', 'Duration_HR': 'Duration_HR_Mean'})
+
+# Rounding for readability
+Clusters_Semifinal_Comparison = Clusters_Semifinal_Comparison.round(2)
+
+# Save
+Clusters_Semifinal_Comparison.to_csv('C:/Users/mm-br/OneDrive - nd.edu/Documents/Mod 3/3 - Unstructured Data Analysis/Final Project/Clusters_SemiFinal_Comparison.csv')
+
+# View
+print(Clusters_Semifinal_Comparison)
+```
+
+![Health Facilities Reclassified by Cluster (Cluster 0)](Map11.jpg)
+
+![Health Facilities Reclassified by Cluster (Cluster 4)](Map13.jpg)
+
+![Health Facilities Reclassified by Cluster (Cluster 5)](Map12.jpg)
+
+### **Step 2:** Add network coverage by cluster.
+
+```{python}
+# Load Clusters_Semifinal_Comparison
+Clusters_Semifinal_Comparison = pd.read_csv('C:/Users/mm-br/OneDrive - nd.edu/Documents/Mod 3/3 - Unstructured Data Analysis/Final Project/Clusters_Semifinal_Comparison.csv')
+```
+
+```{python}
+# Load OpenCellID_Cluster_Coverage
+OpenCellID_Cluster_Coverage = pd.read_csv('C:/Users/mm-br/OneDrive - nd.edu/Documents/Mod 3/3 - Unstructured Data Analysis/Final Project/OpenCellID_Cluster_Coverage.csv')
+
+# Combine with Clusters_Semifinal_Comparison
+Clusters_Semifinal_Comparison['Overlap_Perc_2G'] = OpenCellID_Cluster_Coverage['Overlap_Perc_2G'].iloc[[0, 4, 5]].reset_index(drop = True)
+
+Clusters_Semifinal_Comparison['Overlap_Perc_3G4G'] = OpenCellID_Cluster_Coverage['Overlap_Perc_3G4G'].iloc[[0, 4, 5]].reset_index(drop = True)
+
+# View
+print(Clusters_Semifinal_Comparison)
+```
+
+### **Step 3:** Final selection.
+We now complete the final selection process by running the optimization model on our three semifinalist clusters. The decision weights remain the same as in the initial narrowing process.
+
+```{python}
+decision_matrix = np.array(Clusters_Semifinal_Comparison.iloc[:, 2:7])
+
+decision_weights = np.array([0.3, 0.3, 0.1, 0.1, 0.2])
+
+decision_types = np.array([1, 1, 1, 1, 1])
+
+topsis = mcdm.TOPSIS()
+scores = topsis(decision_matrix, decision_weights, types = decision_types)
+ranking = np.argsort(scores)[::-1]+1
+
+print("Scores: ", scores)
+print("Ranking: ", ranking)
+```
+
+![Best Cluster (Cluster 0)](Map14.jpg)
+
+# Results
+The optimization model recommends Cluster 0 based on our criteria. This appears logical from looking at the map - Cluster 0 covers quite a few health facilities and therefore could serve a large catchment population. It is located far enough from Chipata (located at the eastern edge of the province about halfway up) to benefit from drone delivery over road transport, but not so far as to suffer from low network coverage.
+
+Should Zipline place a hub at the centroid of this cluster, the impact would be significant: a population of over 806k and 137 facilities served, with excellent operational feasibility with 99.96% 2G network coverage.
+
+# Discussion
+This exercise relied heavily on external data sources, and is therefore subject to limitations related to their quality. We saw, for example, that the downloaded Master Facility List for Eastern Province from the Zambia Ministry of Health included facilities whose coordinates fell outside the province's boundaries. It is possible that those facilities *do* belong in Eastern Province, and their coordinate were simply inaccurate, in which case our calculations of total facilities served may not be perfectly accurate. Similarly, routing calls to the OpenRouteService API failed roughly 50% of the time due to "unroutable coordinates" despite georeferencing. Our estimations of distance and duration are therefore based on only partial information.
+
+It may also be worth exploring alternative clustering methods, particularly those that handle classification to more than one cluster (non-partitional methods).
